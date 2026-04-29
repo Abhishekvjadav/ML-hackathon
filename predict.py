@@ -1,20 +1,24 @@
-import json, torch, numpy as np, pandas as pd
+"""
+DoshaNet — Prediction Engine (HANConv Heterogeneous Graph)
+"""
+import json, torch, numpy as np, pandas as pd, pickle
 from sklearn.preprocessing import LabelEncoder
-from torch_geometric.nn import GATConv
+from sklearn.neighbors import kneighbors_graph
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import HANConv
 import torch.nn.functional as F
 
-# ─────────────────────────────────────────
-# 1. LOAD DATA
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# 1. LOAD TRAINED ASSETS
+# ═══════════════════════════════════════════════════════════
 with open('prakriti_clean.json', 'r') as f:
     prakriti = pd.DataFrame(json.load(f))
 with open('ayurgenixai_clean.json', 'r') as f:
     ayur = pd.DataFrame(json.load(f))
 
-# ─────────────────────────────────────────
-# 2. REBUILD ENCODERS
-# ─────────────────────────────────────────
 feature_cols = [c for c in prakriti.columns if c != 'Dosha']
+
+# Rebuild encoders from prakriti
 encoders = {}
 df = prakriti.copy()
 for col in df.columns:
@@ -22,74 +26,110 @@ for col in df.columns:
     df[col] = le.fit_transform(df[col].astype(str))
     encoders[col] = le
 
-X = df[feature_cols].values.astype(np.float32)
-y = df['Dosha'].values
+X_full = df[feature_cols].values.astype(np.float32)
+y_full = df['Dosha'].values
 dosha_names = encoders['Dosha'].classes_
+NUM_CLASSES = len(dosha_names)
 
-# ─────────────────────────────────────────
-# 3. REBUILD GRAPH
-# ─────────────────────────────────────────
-edge_src, edge_dst = [], []
-for i in range(len(y)):
-    for j in range(i+1, len(y)):
-        if y[i] == y[j]:
-            edge_src += [i, j]
-            edge_dst += [j, i]
+# Load saved graph data
+graph_data = torch.load('graph_data.pt', map_location='cpu', weights_only=False)
+k_neighbors = graph_data.get('k_neighbors', 15)
 
-max_edges = 50000
-if len(edge_src) > max_edges:
-    idx = np.random.choice(len(edge_src), max_edges, replace=False)
-    edge_src = [edge_src[i] for i in idx]
-    edge_dst = [edge_dst[i] for i in idx]
+# ═══════════════════════════════════════════════════════════
+# 2. BUILD INITIAL HETERO GRAPH
+# ═══════════════════════════════════════════════════════════
+def build_hetero_graph(X, y):
+    data = HeteroData()
+    num_patients = len(X)
+    num_symptoms = len(feature_cols)
 
-edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
-x_tensor   = torch.tensor(X, dtype=torch.float)
+    data['patient'].x = torch.tensor(X, dtype=torch.float)
+    data['patient'].y = torch.tensor(y, dtype=torch.long)
+    data['symptom'].x = torch.eye(num_symptoms, dtype=torch.float)
+    data['dosha'].x   = torch.eye(NUM_CLASSES, dtype=torch.float)
 
-# ─────────────────────────────────────────
-# 4. LOAD MODEL
-# ─────────────────────────────────────────
-class DoshaGAT(torch.nn.Module):
-    def __init__(self, in_channels, hidden, out_channels, heads=4):
+    # Patient → symptom edges
+    medians = np.median(X, axis=0)
+    p_idx, s_idx = [], []
+    for p in range(num_patients):
+        for s in range(num_symptoms):
+            if X[p, s] >= medians[s]:
+                p_idx.append(p)
+                s_idx.append(s)
+    data['patient', 'has_trait', 'symptom'].edge_index = torch.tensor([p_idx, s_idx], dtype=torch.long)
+
+    # Patient → dosha edges
+    data['patient', 'belongs_to', 'dosha'].edge_index = torch.tensor(
+        [list(range(num_patients)), list(y)], dtype=torch.long
+    )
+
+    # Patient ↔ patient (k-NN)
+    adj = kneighbors_graph(X, n_neighbors=k_neighbors, metric='cosine', include_self=False)
+    rows, cols = adj.nonzero()
+    data['patient', 'similar_to', 'patient'].edge_index = torch.tensor([rows, cols], dtype=torch.long)
+
+    return data
+
+base_data = build_hetero_graph(X_full, y_full)
+
+# ═══════════════════════════════════════════════════════════
+# 3. MODEL DEFINITION
+# ═══════════════════════════════════════════════════════════
+class HeteroDoshaNet(torch.nn.Module):
+    def __init__(self, in_channels_dict, hidden_dim, num_classes, heads=4, dropout=0.3):
         super().__init__()
-        self.gat1 = GATConv(in_channels, hidden, heads=heads, dropout=0.3)
-        self.gat2 = GATConv(hidden*heads, out_channels, heads=1, concat=False, dropout=0.3)
-    def forward(self, x, edge_index):
-        x = F.elu(self.gat1(x, edge_index))
-        x = F.dropout(x, p=0.3, training=self.training)
-        x = self.gat2(x, edge_index)
-        return F.log_softmax(x, dim=1)
+        self.metadata = (
+            ['patient', 'symptom', 'dosha'],
+            [('patient', 'has_trait', 'symptom'),
+             ('patient', 'belongs_to', 'dosha'),
+             ('patient', 'similar_to', 'patient')]
+        )
+        self.han1 = HANConv(in_channels_dict, hidden_dim, metadata=self.metadata,
+                            heads=heads, dropout=dropout)
+        self.bn   = torch.nn.BatchNorm1d(hidden_dim)
+        self.drop = torch.nn.Dropout(dropout)
+        self.han2 = HANConv(hidden_dim, num_classes, metadata=self.metadata,
+                            heads=1, dropout=dropout)
 
-model = DoshaGAT(in_channels=X.shape[1], hidden=32, out_channels=len(dosha_names))
-model.load_state_dict(torch.load('dosha_gat_model.pth'))
+    def forward(self, x_dict, edge_index_dict):
+        out = self.han1(x_dict, edge_index_dict)
+        out = {k: F.elu(self.bn(v)) for k, v in out.items()}
+        out = {k: self.drop(v) for k, v in out.items()}
+        out = self.han2(out, edge_index_dict)
+        return F.log_softmax(out['patient'], dim=1)
+
+# Load trained model
+in_ch = {'patient': X_full.shape[1], 'symptom': len(feature_cols), 'dosha': NUM_CLASSES}
+model = HeteroDoshaNet(in_ch, hidden_dim=64, num_classes=NUM_CLASSES, heads=4, dropout=0.3)
+model.load_state_dict(torch.load('best_model.pt', map_location='cpu', weights_only=True))
 model.eval()
-print("✅ Model loaded!")
+print("✅ HANConv model loaded!")
 
-# ─────────────────────────────────────────
-# 5. REMEDY LOOKUP (fixed format)
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# 4. REMEDY LOOKUP
+# ═══════════════════════════════════════════════════════════
 def get_remedy(dosha_pred):
-    # Convert "vata+pitta" → ["vata", "pitta"]
     parts = [p.strip() for p in dosha_pred.replace('+', ',').split(',')]
 
-    # Try exact multi-dosha match first
+    # Exact multi-dosha match first
     for _, row in ayur.iterrows():
         doshas_in_row = str(row['Doshas']).lower()
         if all(p in doshas_in_row for p in parts):
             return row
 
-    # Fallback: match first dosha only
+    # Fallback: match first dosha
     for _, row in ayur.iterrows():
         if parts[0] in str(row['Doshas']).lower():
             return row
 
     return None
 
-# ─────────────────────────────────────────
-# 6. PREDICT FUNCTION
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# 5. PREDICT FUNCTION
+# ═══════════════════════════════════════════════════════════
 def predict_patient(patient_idx):
     with torch.no_grad():
-        out  = model(x_tensor, edge_index)
+        out  = model(base_data.x_dict, base_data.edge_index_dict)
         pred = out[patient_idx].argmax().item()
         prob = torch.exp(out[patient_idx])
         dosha = dosha_names[pred]
@@ -119,10 +159,10 @@ def predict_patient(patient_idx):
 
     return dosha
 
-# ─────────────────────────────────────────
-# 7. TEST 5 PATIENTS
-# ─────────────────────────────────────────
-print("\n🚀 Testing predictions on 5 patients...\n")
+# ═══════════════════════════════════════════════════════════
+# 6. TEST
+# ═══════════════════════════════════════════════════════════
+print("\n🚀 Testing predictions on 5 patients...")
 for i in [0, 1, 2, 10, 50]:
     predict_patient(i)
 

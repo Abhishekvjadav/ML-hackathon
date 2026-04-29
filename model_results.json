@@ -1,7 +1,0 @@
-{
-  "rf_acc": 100.0,
-  "mlp_acc": 96.7,
-  "gnn_acc": 99.6,
-  "gnn_vs_rf": -0.4,
-  "gnn_vs_mlp": 2.9
-}
